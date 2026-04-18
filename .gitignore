@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Env / secrets
+.env
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Local DB artifacts
+*.sqlite3
+*.db
+
+# Data + index artifacts (regenerable)
+data/chunks.json
+data/*.npy
+data/*.index
+data/knowledge_docs/_index/

@@ -1,0 +1,6 @@
+{"id": "r1", "question": "How should hypertensive emergencies be managed?", "expected_sources": ["hypertension_protocol.txt"], "must_have": ["blood pressure", "monitor"]}
+{"id": "r2", "question": "What should I do if a resident's blood pressure is 180/110?", "expected_sources": ["hypertension_protocol.txt"], "must_have": ["assess", "contact"]}
+{"id": "r3", "question": "What are the dietary principles for diabetic residents?", "expected_sources": ["diabetes_diet.txt"], "must_have": ["carbohydrate", "small frequent meals"]}
+{"id": "r4", "question": "What measures prevent falls in elderly residents?", "expected_sources": ["fall_prevention.txt"], "must_have": ["handrail", "non-slip"]}
+{"id": "r5", "question": "What was Mrs. Li's latest blood glucose reading?", "expected_sources": [], "must_have": ["Mrs. Li"]}
+{"id": "r6", "question": "Mr. Zhang has a blood pressure of 180/110 today, what should I do?", "expected_sources": ["hypertension_protocol.txt"], "must_have": ["Mr. Zhang", "180"]}

@@ -1,0 +1,11 @@
+Hypertensive emergency definition: systolic >=180 mmHg or diastolic >=110 mmHg, with or without target-organ damage.
+
+Management protocol:
+1. Notify the on-duty physician immediately. Do not self-escalate antihypertensive dosage (avoid abrupt drop causing cerebral hypoperfusion).
+2. Place the patient in semi-Fowler position, maintain airway, administer oxygen at 2-3 L/min.
+3. Monitor blood pressure every 15 minutes until below safe range (under 160/100).
+4. Record symptoms: headache, blurred vision, chest pain, nausea. Escalate immediately if any symptom appears.
+5. Notify emergency contact and prepare transfer materials.
+
+Common medications: nifedipine sustained-release (do not split controlled-release), captopril (sublingual 12.5 mg in emergencies).
+Contraindications: vigorous activity, emotional agitation, hot showers.

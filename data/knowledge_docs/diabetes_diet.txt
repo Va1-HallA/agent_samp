@@ -1,0 +1,9 @@
+Diabetic diet principles: control total energy, small frequent meals (5-6 per day), carbohydrates 45-60% of intake.
+
+Abnormal blood glucose management:
+1. Fasting glucose >11.1 mmol/L: record, notify physician to adjust medication, increase monitoring frequency.
+2. Glucose <3.9 mmol/L: immediately give 15 g glucose or juice; recheck after 15 minutes.
+3. Ketosis (glucose >16.7 and urine ketones positive): notify physician immediately, transfer for treatment.
+
+Monitoring times: fasting, 2 hours after each meal, before bedtime.
+Medications: metformin with meals, insulin subcutaneous at physician-prescribed times.
