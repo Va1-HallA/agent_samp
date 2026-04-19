@@ -2,23 +2,23 @@
 
     python -m scripts.run_agent
 
-Type quit/exit or Ctrl+C to leave.
+Credentials: standard boto3 chain. Run ``aws configure`` first, or export
+AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN.
 """
 import asyncio
 
-import anthropic
-
 import config
 from agents.coordinator import Coordinator
+from core.llm_backend import BedrockBackend
 from core.memory import ChatMemory
 
 
 async def main():
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    coordinator = Coordinator(client=client, model=config.MODEL_NAME)
-    memory = ChatMemory(client=client, model=config.MODEL_NAME)
+    llm = BedrockBackend(region=config.AWS_REGION, timeout=config.LLM_TIMEOUT)
+    coordinator = Coordinator(llm=llm, model=config.BEDROCK_MODEL_ID)
+    memory = ChatMemory(llm=llm, model=config.BEDROCK_MODEL_ID)
 
-    print(f"CareAgent started (model={config.MODEL_NAME})")
+    print(f"CareAgent started (model={config.BEDROCK_MODEL_ID})")
     print("Enter a question to begin. Type quit/exit to leave.\n")
 
     while True:

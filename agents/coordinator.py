@@ -2,7 +2,7 @@
 
 Pipeline:
     1. Input guardrail -> cache lookup (return on hit).
-    2. LLM route decision via lightweight ROUTER_MODEL.
+    2. LLM route decision via lightweight BEDROCK_ROUTER_MODEL_ID.
     3. Dispatch to specialist agents: triage / protocol / both (serial) / direct.
     4. Merge triage + protocol into a final report.
     5. Auto-create alert when triage severity is high.
@@ -17,8 +17,6 @@ import logging
 import re
 from typing import AsyncIterator
 
-import anthropic
-
 import config
 from agents.triage_agent import create_triage_agent
 from agents.protocol_agent import create_protocol_agent
@@ -29,6 +27,7 @@ from core.guardrails import (
     check_input,
     check_output,
 )
+from core.llm_backend import LLMBackend, LLMError
 from core.llm_client import call_messages
 from core.cache import QueryCache
 from core.context import get_tenant_id
@@ -44,8 +43,11 @@ _VALID_ROUTES = {"triage", "protocol", "both", "direct"}
 _DIRECT_SYSTEM = "You are a care assistant. Answer general questions concisely."
 
 
+_SENTINEL = object()
+
+
 async def _iterate_stream(stream_ctx) -> AsyncIterator[str]:
-    """Adapt the anthropic synchronous stream context to an async iterator."""
+    """Adapt the synchronous stream context to an async iterator."""
     def _enter():
         return stream_ctx.__enter__()
 
@@ -68,13 +70,10 @@ async def _iterate_stream(stream_ctx) -> AsyncIterator[str]:
         await asyncio.to_thread(_exit)
 
 
-_SENTINEL = object()
-
-
 class Coordinator:
     def __init__(
         self,
-        client: anthropic.Anthropic,
+        llm: LLMBackend,
         model: str,
         router_model: str | None = None,
         health: HealthService | None = None,
@@ -82,16 +81,16 @@ class Coordinator:
         knowledge: KnowledgeService | None = None,
         cache: QueryCache | None = None,
     ):
-        self.client = client
+        self.llm = llm
         self.model = model
-        self.router_model = router_model or config.ROUTER_MODEL
+        self.router_model = router_model or config.BEDROCK_ROUTER_MODEL_ID
         self.health = health or HealthService()
         self.alert = alert or AlertService()
         self.knowledge = knowledge or KnowledgeService()
-        self.cache = cache or QueryCache(redis_client=None)
+        self.cache = cache or QueryCache()
 
-        self.triage = create_triage_agent(client, model, health=self.health)
-        self.protocol = create_protocol_agent(client, model, knowledge=self.knowledge)
+        self.triage = create_triage_agent(llm, model, health=self.health)
+        self.protocol = create_protocol_agent(llm, model, knowledge=self.knowledge)
 
     async def run(self, query: str, chat_history: list[dict] | None = None) -> str:
         try:
@@ -151,8 +150,8 @@ class Coordinator:
             if cacheable and answer != SAFE_FALLBACK:
                 self.cache.set(tenant_id, query, answer)
             return answer
-        except anthropic.APIError as e:
-            logger.exception("LLM API error in Coordinator.run")
+        except LLMError as e:
+            logger.exception("LLM error in Coordinator.run")
             return f"{SAFE_FALLBACK} (LLM service error: {type(e).__name__})"
         except Exception as e:
             logger.exception("Unexpected error in Coordinator.run")
@@ -222,9 +221,9 @@ class Coordinator:
 
             full = self._safe(full)
             yield {"event": "done", "data": {"full": full}}
-        except anthropic.APIError as e:
-            logger.exception("LLM API error in Coordinator.run_stream")
-            yield {"event": "error", "data": {"reason": f"llm_api:{type(e).__name__}"}}
+        except LLMError as e:
+            logger.exception("LLM error in Coordinator.run_stream")
+            yield {"event": "error", "data": {"reason": f"llm:{type(e).__name__}"}}
         except Exception:
             logger.exception("Unexpected error in Coordinator.run_stream")
             yield {"event": "error", "data": {"reason": "internal_error"}}
@@ -236,7 +235,7 @@ class Coordinator:
         messages.append({"role": "user", "content": query})
 
         def _run():
-            return self.client.messages.stream(
+            return self.llm.stream(
                 model=self.model,
                 max_tokens=512,
                 system=_DIRECT_SYSTEM,
@@ -257,7 +256,7 @@ class Coordinator:
             parts.append(f"[Care protocol]\n{protocol}\n")
 
         def _run():
-            return self.client.messages.stream(
+            return self.llm.stream(
                 model=self.model,
                 max_tokens=1024,
                 system=MERGE_PROMPT,
@@ -273,20 +272,20 @@ class Coordinator:
     def _decide_route(self, query: str) -> str:
         try:
             resp = call_messages(
-                self.client,
+                self.llm,
                 model=self.router_model,
                 max_tokens=100,
                 system=ROUTER_PROMPT,
                 messages=[{"role": "user", "content": query}],
             )
-        except anthropic.APIError:
+        except LLMError:
             logger.warning("route LLM call failed, default to 'both'", exc_info=True)
             return "both"
 
         text = ""
         for block in resp.content:
             if block.type == "text":
-                text = block.text
+                text = block.text or ""
                 break
 
         route: str | None = None
@@ -311,18 +310,18 @@ class Coordinator:
         messages.append({"role": "user", "content": query})
         try:
             resp = call_messages(
-                self.client,
+                self.llm,
                 model=self.model,
                 max_tokens=512,
                 system=_DIRECT_SYSTEM,
                 messages=messages,
             )
-        except anthropic.APIError:
+        except LLMError:
             logger.warning("direct_answer LLM call failed", exc_info=True)
             return SAFE_FALLBACK
 
         for block in resp.content:
-            if block.type == "text":
+            if block.type == "text" and block.text:
                 return block.text
         return ""
 
@@ -337,16 +336,16 @@ class Coordinator:
 
         try:
             resp = call_messages(
-                self.client,
+                self.llm,
                 model=self.model,
                 max_tokens=1024,
                 system=MERGE_PROMPT,
                 messages=[{"role": "user", "content": "\n".join(parts)}],
             )
             for block in resp.content:
-                if block.type == "text":
+                if block.type == "text" and block.text:
                     return block.text
-        except anthropic.APIError:
+        except LLMError:
             logger.warning("merge LLM call failed, returning raw sections", exc_info=True)
 
         # Fallback: concatenate raw sections so the user still gets information.

@@ -1,0 +1,22 @@
+region  = "us-east-1"
+project = "care-agent"
+env     = "prod"
+
+# On the FIRST terraform apply, leave container_image empty — the ECR repo
+# doesn't exist yet. ECS will then boot with `<ecr_url>:latest`, which 404s,
+# and the service stays in PENDING. That is expected: build + push the image
+# first, then run `aws ecs update-service --force-new-deployment` to pull it.
+container_image = ""
+
+# Tighten this to your office / home IP once the smoke test passes so the
+# ALB isn't world-reachable.
+allowed_admin_cidr = "0.0.0.0/0"
+
+# Bump for prod. t4g.small + t3.small.search keeps monthly idle cost low.
+rds_instance_class        = "db.t4g.small"
+opensearch_instance_type  = "t3.small.search"
+opensearch_instance_count = 1
+
+task_cpu      = "1024"
+task_memory   = "2048"
+desired_count = 1

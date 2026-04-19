@@ -21,11 +21,10 @@ import statistics
 import time
 from pathlib import Path
 
-import anthropic
-
 import config
 from agents.coordinator import Coordinator
 from core.guardrails import SAFE_FALLBACK
+from core.llm_backend import BedrockBackend
 from services.knowledge_service import KnowledgeService
 
 
@@ -83,8 +82,8 @@ def eval_retrieval(cases: list[dict], top_k: int = 5) -> dict:
 # ---------- End-to-end ----------
 
 async def eval_end_to_end(cases: list[dict]) -> dict:
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    coordinator = Coordinator(client=client, model=config.MODEL_NAME)
+    llm = BedrockBackend(region=config.AWS_REGION, timeout=config.LLM_TIMEOUT)
+    coordinator = Coordinator(llm=llm, model=config.BEDROCK_MODEL_ID)
 
     per_case = []
     latencies: list[float] = []

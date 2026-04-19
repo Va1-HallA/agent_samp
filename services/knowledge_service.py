@@ -1,8 +1,9 @@
 """Knowledge retrieval abstraction.
 
-Prefers infra.rag.KnowledgeBase (Milvus dense + Elasticsearch sparse + RRF).
-Falls back to a local txt stub if the real backend fails to start and the
-fallback is explicitly allowed by config (dev only by default).
+Prefers infra.rag.KnowledgeBase (OpenSearch hybrid: knn_vector + BM25, with
+Bedrock Titan embeddings). Falls back to a local txt stub if the real backend
+fails to start and the fallback is explicitly allowed by config (dev only by
+default).
 """
 import logging
 from pathlib import Path

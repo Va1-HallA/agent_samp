@@ -1,12 +1,17 @@
-import anthropic
+"""Short-term chat memory with summarisation.
+
+Persists to a session store (see infra.session_store); this class is just the
+in-process rolling buffer + summariser.
+"""
+from core.llm_backend import LLMBackend, LLMError
 
 
 class ChatMemory:
     # Cap on rolled-up summary length to prevent unbounded growth.
     MAX_SUMMARY_CHARS = 2000
 
-    def __init__(self, client: anthropic.Anthropic, model: str, max_turns: int = 20):
-        self.client = client
+    def __init__(self, llm: LLMBackend, model: str, max_turns: int = 20):
+        self.llm = llm
         self.model = model
         self.max_turns = max_turns
         self.summary = ""
@@ -33,21 +38,22 @@ class ChatMemory:
         self.messages.clear()
 
         try:
-            response = self.client.messages.create(
+            response = self.llm.create(
                 model=self.model,
                 max_tokens=512,
                 system="Summarize the key points of the following conversation (names, data, conclusions) in under 300 words.",
-                messages=old_messages
+                messages=old_messages,
             )
-        except Exception:
-            # If compression fails, keep the tail of the original messages.
+        except LLMError:
+            # Compression is best-effort; if it fails, keep the tail of the
+            # original messages so the conversation is not lost.
             self.messages = old_messages[-self.max_turns:]
             return
 
         new_summary = ""
         for block in response.content:
             if block.type == "text":
-                new_summary = block.text
+                new_summary = block.text or ""
                 break
 
         combined = f"{self.summary}\n{new_summary}" if self.summary else new_summary

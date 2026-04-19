@@ -1,8 +1,8 @@
 """Generic ReAct agent.
 
 - system_prompt / tools are injected via constructor.
-- Tool dispatch goes through ToolRegistry (no text parsing; relies on Claude
-  native tool_use blocks).
+- Tool dispatch goes through ToolRegistry (no text parsing; relies on the
+  Bedrock Converse API's native toolUse blocks, mapped to our ContentBlock).
 - stop_reason drives the loop: tool_use -> execute -> append tool_result ->
   next turn; end_turn -> return text.
 - Guardrails: check_input on entry, check_tool_call on each tool call,
@@ -10,14 +10,11 @@
 - All LLM calls go through core.llm_client.call_messages (retry + timeout).
 
 Exception strategy:
-    GuardrailViolation (input)              -> SAFE_FALLBACK
-    anthropic.APIError / unexpected errors  -> SAFE_FALLBACK + reason
-    Tool exceptions                          -> fed back to the LLM as text
+    GuardrailViolation (input)      -> SAFE_FALLBACK
+    LLMError / unexpected errors    -> SAFE_FALLBACK + reason
+    Tool exceptions                  -> fed back to the LLM as text
 """
 import logging
-
-import anthropic
-from anthropic.types import Message
 
 from agents.tool_registry import ToolRegistry
 from core.guardrails import (
@@ -27,6 +24,7 @@ from core.guardrails import (
     check_output,
     check_tool_call,
 )
+from core.llm_backend import ContentBlock, LLMBackend, LLMError, LLMResponse
 from core.llm_client import call_messages
 
 logger = logging.getLogger(__name__)
@@ -38,7 +36,7 @@ class BaseAgent:
         name: str,
         system_prompt: str,
         registry: ToolRegistry,
-        client: anthropic.Anthropic,
+        llm: LLMBackend,
         model: str,
         max_tokens: int = 2048,
         max_steps: int = 10,
@@ -47,7 +45,7 @@ class BaseAgent:
         self.name = name
         self.system_prompt = system_prompt
         self.registry = registry
-        self.client = client
+        self.llm = llm
         self.model = model
         self.max_tokens = max_tokens
         self.max_steps = max_steps
@@ -81,16 +79,16 @@ class BaseAgent:
                 return self._safe_output(raw)
 
             return f"[{self.name}] max_steps exceeded"
-        except anthropic.APIError as e:
-            logger.exception("LLM API error in %s.run", self.name)
+        except LLMError as e:
+            logger.exception("LLM error in %s.run", self.name)
             return f"{SAFE_FALLBACK} (LLM service error: {type(e).__name__})"
         except Exception as e:
             logger.exception("Unexpected error in %s.run", self.name)
             return f"{SAFE_FALLBACK} (internal error: {type(e).__name__})"
 
-    def _call_llm(self, messages: list[dict]) -> Message:
+    def _call_llm(self, messages: list[dict]) -> LLMResponse:
         return call_messages(
-            self.client,
+            self.llm,
             model=self.model,
             max_tokens=self.max_tokens,
             system=self.system_prompt,
@@ -98,7 +96,7 @@ class BaseAgent:
             messages=messages,
         )
 
-    def _run_tools(self, response: Message) -> list[dict]:
+    def _run_tools(self, response: LLMResponse) -> list[dict]:
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -121,9 +119,9 @@ class BaseAgent:
         return results
 
     @staticmethod
-    def _extract_text(response: Message) -> str | None:
+    def _extract_text(response: LLMResponse) -> str | None:
         for block in response.content:
-            if block.type == "text":
+            if block.type == "text" and block.text:
                 return block.text
         return None
 

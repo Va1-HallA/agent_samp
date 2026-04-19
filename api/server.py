@@ -1,16 +1,17 @@
 """FastAPI HTTP server.
 
-Run: uvicorn api.server:app --reload --host 0.0.0.0 --port 8000
+Run locally:
+    uvicorn api.server:app --reload --host 0.0.0.0 --port 8000
+
+On AWS (ECS Fargate) the Dockerfile's CMD boots uvicorn the same way.
 """
 import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
-import anthropic
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -20,10 +21,12 @@ from agents.coordinator import Coordinator
 from core.cache import QueryCache
 from core.context import set_tenant_id, get_tenant_id
 from core.guardrails import SAFE_FALLBACK
+from core.llm_backend import BedrockBackend, LLMBackend
+from core.llm_client import set_token_tracker
 from core.memory import ChatMemory
 from core.metrics import TokenTracker
-from core.llm_client import set_token_tracker
 from core.tracing import start_request, end_request
+from infra.session_store import SessionStore, build_session_store
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +34,11 @@ logger = logging.getLogger(__name__)
 # ---------- Process-wide singletons ----------
 
 class _State:
-    client: anthropic.Anthropic | None = None
+    llm: LLMBackend | None = None
     coordinator: Coordinator | None = None
-    redis = None
     cache: QueryCache | None = None
     tokens: TokenTracker | None = None
-    fallback_store: dict[str, dict] = {}
+    sessions: SessionStore | None = None
 
 
 state = _State()
@@ -79,31 +81,14 @@ limiter = Limiter(key_func=_rate_limit_key)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    state.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    try:
-        import redis
-        state.redis = redis.Redis(
-            host=config.REDIS_HOST, port=config.REDIS_PORT,
-            decode_responses=True, socket_connect_timeout=1,
-        )
-        state.redis.ping()
-    except Exception:
-        if not config.ALLOW_INPROC_MEMORY_FALLBACK:
-            raise RuntimeError(
-                "Redis unavailable and in-process memory fallback is disabled"
-            )
-        logger.warning(
-            "Redis unavailable; using in-process fallback store & no cache",
-            exc_info=True,
-        )
-        state.redis = None
-
-    state.cache = QueryCache(redis_client=state.redis)
-    state.tokens = TokenTracker(redis_client=state.redis)
+    state.llm = BedrockBackend(region=config.AWS_REGION, timeout=config.LLM_TIMEOUT)
+    state.sessions = build_session_store()
+    state.cache = QueryCache()
+    state.tokens = TokenTracker()
     set_token_tracker(state.tokens)
     state.coordinator = Coordinator(
-        client=state.client,
-        model=config.MODEL_NAME,
+        llm=state.llm,
+        model=config.BEDROCK_MODEL_ID,
         cache=state.cache,
     )
     yield
@@ -151,43 +136,22 @@ class ChatResponse(BaseModel):
 
 # ---------- Memory helpers ----------
 
-def _session_key(tenant_id: str, session_id: str) -> str:
-    # Tenant prefix prevents session_id collisions across tenants.
-    return f"chat:{tenant_id}:{session_id}"
-
-
 def _load_memory(tenant_id: str, session_id: str) -> ChatMemory:
-    memory = ChatMemory(client=state.client, model=config.MODEL_NAME)
-    key = _session_key(tenant_id, session_id)
-    if state.redis:
-        raw = state.redis.get(key)
-        if raw:
-            data = json.loads(raw)
-            memory.summary = data.get("summary", "")
-            memory.messages = data.get("messages", [])
-    else:
-        if not config.ALLOW_INPROC_MEMORY_FALLBACK:
-            raise RuntimeError("in-process memory fallback is disabled")
-        data = state.fallback_store.get(key)
-        if data:
-            memory.summary = data["summary"]
-            memory.messages = list(data["messages"])
+    memory = ChatMemory(llm=state.llm, model=config.BEDROCK_MODEL_ID)
+    stored = state.sessions.load(tenant_id, session_id) if state.sessions else None
+    if stored:
+        memory.summary = stored.get("summary", "") or ""
+        memory.messages = stored.get("messages", []) or []
     return memory
 
 
 def _save_memory(tenant_id: str, session_id: str, memory: ChatMemory) -> None:
-    payload = {"summary": memory.summary, "messages": memory.messages}
-    key = _session_key(tenant_id, session_id)
-    if state.redis:
-        state.redis.set(
-            key,
-            json.dumps(payload, ensure_ascii=False),
-            ex=config.SESSION_TTL_SECONDS,
-        )
-    else:
-        if not config.ALLOW_INPROC_MEMORY_FALLBACK:
-            raise RuntimeError("in-process memory fallback is disabled")
-        state.fallback_store[key] = payload
+    if state.sessions is None:
+        return
+    state.sessions.save(tenant_id, session_id, {
+        "summary": memory.summary,
+        "messages": memory.messages,
+    })
 
 
 # ---------- Endpoints ----------
@@ -197,11 +161,12 @@ def health():
     ks = state.coordinator.knowledge if state.coordinator else None
     return {
         "status": "ok",
-        "model": config.MODEL_NAME,
-        "router_model": config.ROUTER_MODEL,
+        "model": config.BEDROCK_MODEL_ID,
+        "router_model": config.BEDROCK_ROUTER_MODEL_ID,
+        "embedding_model": config.BEDROCK_EMBEDDING_MODEL_ID,
         "app_env": config.APP_ENV,
         "tenant_source": config.TENANT_SOURCE,
-        "redis": bool(state.redis),
+        "session_store": type(state.sessions).__name__ if state.sessions else None,
         "inproc_memory_fallback": config.ALLOW_INPROC_MEMORY_FALLBACK,
         "cache_enabled": state.cache.enabled if state.cache else False,
         "knowledge_fallback": ks.is_using_fallback() if ks else None,
@@ -222,7 +187,7 @@ async def chat(request: Request, req: ChatRequest):
         memory = _load_memory(tenant_id, session_id)
     except Exception:
         logger.exception("load memory failed, starting fresh")
-        memory = ChatMemory(client=state.client, model=config.MODEL_NAME)
+        memory = ChatMemory(llm=state.llm, model=config.BEDROCK_MODEL_ID)
 
     # Coordinator.run already catches LLM / guardrail errors and degrades to
     # SAFE_FALLBACK; this is a last-resort guard for unexpected failures.
@@ -232,8 +197,6 @@ async def chat(request: Request, req: ChatRequest):
         logger.exception("coordinator.run crashed")
         answer = SAFE_FALLBACK
 
-    # Append this turn before compressing/saving so the data is not lost if
-    # compression fails.
     memory.add_turn("user", req.message)
     memory.add_turn("assistant", answer)
     try:
@@ -252,13 +215,8 @@ async def chat(request: Request, req: ChatRequest):
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str):
     tenant_id = get_tenant_id()
-    key = _session_key(tenant_id, session_id)
-    if state.redis:
-        state.redis.delete(key)
-    else:
-        if not config.ALLOW_INPROC_MEMORY_FALLBACK:
-            raise RuntimeError("in-process memory fallback is disabled")
-        state.fallback_store.pop(key, None)
+    if state.sessions is not None:
+        state.sessions.delete(tenant_id, session_id)
     return {"ok": True}
 
 
@@ -285,7 +243,7 @@ async def chat_stream(request: Request, req: ChatRequest):
         memory = _load_memory(tenant_id, session_id)
     except Exception:
         logger.exception("load memory failed, starting fresh")
-        memory = ChatMemory(client=state.client, model=config.MODEL_NAME)
+        memory = ChatMemory(llm=state.llm, model=config.BEDROCK_MODEL_ID)
 
     history = memory.get_history()
 
@@ -329,7 +287,13 @@ def _sse(event: str, data) -> str:
 
 @app.get("/metrics/tokens")
 def tokens_summary():
-    """Token usage and cost summary for the current tenant."""
+    """Token usage and cost summary for the current tenant.
+
+    On AWS the authoritative numbers come from CloudWatch Metrics
+    (namespace ``CareAgent``). The response here is a pointer to the
+    dashboard query; the in-process tracker only emits, it does not
+    aggregate.
+    """
     tenant_id = get_tenant_id()
     if state.tokens is None:
         return {"enabled": False}

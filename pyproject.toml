@@ -1,0 +1,49 @@
+[project]
+name = "care-agent"
+version = "0.1.0"
+description = "Multi-agent triage + protocol lookup service backed by AWS Bedrock."
+requires-python = ">=3.11,<3.13"
+readme = "README.md"
+
+dependencies = [
+    # Web framework.
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "slowapi>=0.1.9",
+
+    # Relational DB.
+    "sqlalchemy>=2.0",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.13",
+
+    # AWS SDK + OpenSearch client.
+    "boto3>=1.34",
+    "botocore>=1.34",
+    "opensearch-py>=2.4",
+    "requests-aws4auth>=1.2",
+
+    # Reliability.
+    "tenacity>=8.2",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[tool.uv]
+# Keep the resolver strict; fail fast on version conflicts rather than
+# silently downgrading a transitive dep.
+resolution = "highest"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agents", "api", "core", "eval", "infra", "scripts", "services"]

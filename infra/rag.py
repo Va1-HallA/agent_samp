@@ -1,21 +1,33 @@
-"""RAG retrieval stack.
+"""RAG retrieval stack on AWS.
 
-    Chunker -> Embedder -> MilvusDenseRetriever ┐
-                           ESRetriever (BM25)    ├-> rrf_fusion -> KnowledgeBase
-                                                 ┘
+    Chunker -> BedrockEmbedder -> OpenSearchHybridRetriever
+                                      (knn + match in one index, RRF fused)
+                                             -> KnowledgeBase
 
-KnowledgeBase is the only public entry point; service layers call .search().
+Why a single OpenSearch index instead of Milvus + Elasticsearch?
+    - OpenSearch supports knn_vector and text fields in the same mapping, so
+      dense + sparse retrieval hit the same shards and the same documents. A
+      single cluster replaces two, cutting idle cost roughly in half.
+    - Serverless OpenSearch is an option but kept as a drop-in (the client
+      construction is identical; only the service code in SigV4 changes).
+
+Auth: SigV4 via ``requests-aws4auth`` + ``opensearch-py``'s RequestsHttpConnection.
+Credentials come from the standard boto3 chain — the ECS task role on AWS,
+local ~/.aws/credentials in dev.
 """
 from __future__ import annotations
 
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
-from pymilvus import (
-    connections, Collection, FieldSchema, CollectionSchema, DataType, utility,
-)
-from sentence_transformers import SentenceTransformer
+import logging
+from typing import Any, Iterable
+
+import boto3
+from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
+from requests_aws4auth import AWS4Auth
 
 import config
+from core.llm_backend import BedrockBackend, LLMBackend, LLMError
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -44,7 +56,6 @@ class Chunker:
             end = start + self.chunk_size
             slice_text = content[start:end]
 
-            # For non-tail chunks, snap back to the nearest separator.
             if end < n:
                 for sep in [".", "!", "?", "\n", ";", ","]:
                     last_sep = slice_text.rfind(sep)
@@ -66,210 +77,182 @@ class Chunker:
 
 
 # ============================================================
-# Embedder (Dense)
+# Embedder (Bedrock Titan Embed v2)
 # ============================================================
 
-class Embedder:
-    """BGE embedding. Query side auto-prepends the BGE instruction."""
+class BedrockEmbedder:
+    """Titan Embed v2 produces L2-normalised vectors of configurable dim."""
 
-    _QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+    def __init__(self, llm: LLMBackend | None = None, model: str | None = None, dim: int | None = None):
+        self.llm = llm or BedrockBackend(region=config.AWS_REGION)
+        self.model = model or config.BEDROCK_EMBEDDING_MODEL_ID
+        self.dim = dim or config.EMBEDDING_DIM
 
-    def __init__(self, model_name: str | None = None):
-        model_name = model_name or config.EMBEDDING_MODEL
-        self.model = SentenceTransformer(model_name)
-        self.dim: int = self.model.get_sentence_embedding_dimension()
+    def encode_query(self, text: str) -> list[float]:
+        return self.llm.embed(model=self.model, text=text)
 
-    def encode_docs(self, texts: list[str], batch_size: int = 32) -> list[list[float]]:
-        vecs = self.model.encode(
-            texts,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
+    def encode_docs(self, texts: Iterable[str]) -> list[list[float]]:
+        # Titan Embed has no batch endpoint; loop sequentially. Rate is typically
+        # not the bottleneck for the offline build.
+        out: list[list[float]] = []
+        for t in texts:
+            try:
+                out.append(self.llm.embed(model=self.model, text=t))
+            except LLMError:
+                logger.exception("embed failed for chunk of length %d", len(t))
+                out.append([0.0] * self.dim)
+        return out
+
+
+# ============================================================
+# OpenSearch hybrid retriever
+# ============================================================
+
+def _default_client(endpoint: str, region: str) -> OpenSearch:
+    credentials = boto3.Session().get_credentials()
+    if credentials is None:
+        raise RuntimeError(
+            "no AWS credentials available; configure an ECS task role or "
+            "aws configure locally"
         )
-        return vecs.tolist()
-
-    def encode_query(self, query: str) -> list[float]:
-        prefixed = self._QUERY_INSTRUCTION + query
-        vec = self.model.encode([prefixed], normalize_embeddings=True, show_progress_bar=False)
-        return vec[0].tolist()
-
-
-# ============================================================
-# Milvus (Dense retriever)
-# ============================================================
-
-class MilvusDenseRetriever:
-    def __init__(
-        self,
-        host: str | None = None,
-        port: int | None = None,
-        collection_name: str | None = None,
-        dim: int = 512,
-    ):
-        self.host = host or config.MILVUS_HOST
-        self.port = port or config.MILVUS_PORT
-        self.collection_name = collection_name or config.MILVUS_COLLECTION
-        self.dim = dim
-        self._connect()
-        self.collection = self._ensure_collection()
-        self._loaded = False
-        self._try_load()
-
-    def _try_load(self) -> None:
-        try:
-            self.collection.load()
-            self._loaded = True
-        except Exception:
-            # May fail on empty collection; retried during search.
-            self._loaded = False
-
-    def _connect(self):
-        if not connections.has_connection("default"):
-            connections.connect("default", host=self.host, port=str(self.port))
-
-    def _ensure_collection(self) -> Collection:
-        if utility.has_collection(self.collection_name):
-            return Collection(self.collection_name)
-
-        fields = [
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=2000),
-            FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=300),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dim),
-        ]
-        schema = CollectionSchema(fields, description="CareAgent knowledge base")
-        col = Collection(self.collection_name, schema)
-        col.create_index(
-            field_name="embedding",
-            index_params={
-                "index_type": "IVF_FLAT",
-                "metric_type": "COSINE",
-                "params": {"nlist": 64},
-            },
-        )
-        return col
-
-    def reset(self) -> None:
-        """Drop + recreate. Used by the offline build script."""
-        if utility.has_collection(self.collection_name):
-            utility.drop_collection(self.collection_name)
-        self.collection = self._ensure_collection()
-        self._loaded = False
-
-    def insert(
-        self,
-        texts: list[str],
-        sources: list[str],
-        embeddings: list[list[float]],
-    ) -> None:
-        assert len(texts) == len(sources) == len(embeddings)
-        self.collection.insert([texts, sources, embeddings])
-        self.collection.flush()
-        self._loaded = False
-
-    def search(self, query_vec: list[float], top_k: int = 10) -> list[dict]:
-        if not self._loaded:
-            self._try_load()
-        results = self.collection.search(
-            data=[query_vec],
-            anns_field="embedding",
-            param={"metric_type": "COSINE", "params": {"nprobe": 8}},
-            limit=top_k,
-            output_fields=["text", "source"],
-        )
-        return [
-            {
-                "text": hit.entity.get("text"),
-                "source": hit.entity.get("source"),
-                "score": float(hit.distance),
-            }
-            for hit in results[0]
-        ]
+    awsauth = AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        region,
+        "es",
+        session_token=credentials.token,
+    )
+    return OpenSearch(
+        hosts=[{"host": endpoint, "port": 443}],
+        http_auth=awsauth,
+        use_ssl=True,
+        verify_certs=True,
+        connection_class=RequestsHttpConnection,
+        timeout=30,
+    )
 
 
-# ============================================================
-# Elasticsearch (Sparse retriever, BM25)
-# ============================================================
-
-class ESRetriever:
-    """BM25 retriever over Elasticsearch with a CJK analyzer."""
+class OpenSearchHybridRetriever:
+    """Single index holding both the text and the knn_vector for each chunk."""
 
     def __init__(
         self,
-        url: str | None = None,
+        endpoint: str | None = None,
         index_name: str | None = None,
+        region: str | None = None,
+        dim: int | None = None,
+        client: OpenSearch | None = None,
     ):
-        self.url = url or config.ES_URL
-        self.index_name = index_name or config.ES_INDEX
-        self.client = Elasticsearch(self.url, request_timeout=30)
+        self.endpoint = endpoint or config.OPENSEARCH_ENDPOINT
+        self.index_name = index_name or config.OPENSEARCH_INDEX
+        self.region = region or config.AWS_REGION
+        self.dim = dim or config.EMBEDDING_DIM
+        if client is not None:
+            self.client = client
+        else:
+            if not self.endpoint:
+                raise RuntimeError("OPENSEARCH_ENDPOINT is not configured")
+            self.client = _default_client(self.endpoint, self.region)
+
+    # ----- index lifecycle -----
+
+    def _mapping(self) -> dict[str, Any]:
+        return {
+            "settings": {
+                "index": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "knn": True,
+                },
+            },
+            "mappings": {
+                "properties": {
+                    "text": {"type": "text"},
+                    "source": {"type": "keyword"},
+                    "embedding": {
+                        "type": "knn_vector",
+                        "dimension": self.dim,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "nmslib",
+                            "parameters": {"ef_construction": 128, "m": 24},
+                        },
+                    },
+                }
+            },
+        }
+
+    def ensure_index(self) -> None:
+        if not self.client.indices.exists(index=self.index_name):
+            self.client.indices.create(index=self.index_name, body=self._mapping())
 
     def reset(self) -> None:
         if self.client.indices.exists(index=self.index_name):
             self.client.indices.delete(index=self.index_name)
-        self._create_index()
-
-    def _create_index(self) -> None:
-        self.client.indices.create(
-            index=self.index_name,
-            body={
-                "settings": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0,
-                    "analysis": {
-                        "analyzer": {
-                            "cn_analyzer": {"type": "cjk"}
-                        }
-                    },
-                },
-                "mappings": {
-                    "properties": {
-                        "text": {"type": "text", "analyzer": "cn_analyzer"},
-                        "source": {"type": "keyword"},
-                    }
-                },
-            },
-        )
-
-    def ensure_index(self) -> None:
-        if not self.client.indices.exists(index=self.index_name):
-            self._create_index()
-
-    def bulk_insert(self, corpus: list[dict]) -> None:
-        """corpus: [{text, source}, ...]"""
         self.ensure_index()
-        actions = [
-            {"_index": self.index_name, "_source": {"text": d["text"], "source": d["source"]}}
-            for d in corpus
-        ]
-        bulk(self.client, actions, refresh="wait_for")
 
-    def search(self, query: str, top_k: int = 10) -> list[dict]:
+    # ----- write -----
+
+    def bulk_insert(self, docs: list[dict]) -> None:
+        """docs: [{text, source, embedding}]."""
+        self.ensure_index()
+        actions = (
+            {
+                "_index": self.index_name,
+                "_source": {
+                    "text": d["text"],
+                    "source": d["source"],
+                    "embedding": d["embedding"],
+                },
+            }
+            for d in docs
+        )
+        helpers.bulk(self.client, actions, refresh="wait_for")
+
+    # ----- read -----
+
+    def dense_search(self, query_vec: list[float], top_k: int = 20) -> list[dict]:
         if not self.client.indices.exists(index=self.index_name):
             return []
-        resp = self.client.search(
-            index=self.index_name,
-            body={
-                "query": {
-                    "match": {
-                        "text": {"query": query, "operator": "or"}
-                    }
-                },
-                "size": top_k,
+        body = {
+            "size": top_k,
+            "query": {
+                "knn": {
+                    "embedding": {"vector": query_vec, "k": top_k}
+                }
             },
-        )
-        hits = []
-        for hit in resp["hits"]["hits"]:
-            src = hit["_source"]
-            hits.append({
-                "text": src["text"],
-                "source": src["source"],
-                "score": float(hit["_score"]),
+            "_source": ["text", "source"],
+        }
+        resp = self.client.search(index=self.index_name, body=body)
+        return self._hits(resp)
+
+    def sparse_search(self, query: str, top_k: int = 20) -> list[dict]:
+        if not self.client.indices.exists(index=self.index_name):
+            return []
+        body = {
+            "size": top_k,
+            "query": {"match": {"text": {"query": query, "operator": "or"}}},
+            "_source": ["text", "source"],
+        }
+        resp = self.client.search(index=self.index_name, body=body)
+        return self._hits(resp)
+
+    @staticmethod
+    def _hits(resp: dict) -> list[dict]:
+        out = []
+        for hit in resp.get("hits", {}).get("hits", []):
+            src = hit.get("_source", {})
+            out.append({
+                "text": src.get("text", ""),
+                "source": src.get("source", ""),
+                "score": float(hit.get("_score", 0.0)),
             })
-        return hits
+        return out
 
 
 # ============================================================
-# Fusion
+# Fusion (RRF)
 # ============================================================
 
 def rrf_fusion(
@@ -303,30 +286,26 @@ def rrf_fusion(
 # ============================================================
 
 class KnowledgeBase:
-    """Combines dense (Milvus) + sparse (ES) retrieval with RRF fusion."""
+    """Hybrid retrieval: dense k-NN + sparse BM25 against one OpenSearch index."""
 
     def __init__(
         self,
-        milvus_host: str | None = None,
-        milvus_port: int | None = None,
-        collection_name: str | None = None,
-        embedding_model: str | None = None,
-        es_url: str | None = None,
-        es_index: str | None = None,
+        endpoint: str | None = None,
+        index_name: str | None = None,
+        region: str | None = None,
+        embedder: BedrockEmbedder | None = None,
+        retriever: OpenSearchHybridRetriever | None = None,
     ):
-        self.embedder = Embedder(embedding_model)
-        self.dense = MilvusDenseRetriever(
-            host=milvus_host,
-            port=milvus_port,
-            collection_name=collection_name,
+        self.embedder = embedder or BedrockEmbedder()
+        self.retriever = retriever or OpenSearchHybridRetriever(
+            endpoint=endpoint, index_name=index_name, region=region,
             dim=self.embedder.dim,
         )
-        self.sparse = ESRetriever(url=es_url, index_name=es_index)
 
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         query_vec = self.embedder.encode_query(query)
-        dense_hits = self.dense.search(query_vec, top_k=20)
-        sparse_hits = self.sparse.search(query, top_k=20)
+        dense_hits = self.retriever.dense_search(query_vec, top_k=20)
+        sparse_hits = self.retriever.sparse_search(query, top_k=20)
 
         if not sparse_hits:
             return dense_hits[:top_k]

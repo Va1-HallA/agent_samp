@@ -2,13 +2,17 @@
 
     python -m scripts.build_knowledge
 
-Reads data/knowledge_docs/*.txt, chunks them, embeds with BGE, and writes
-to Milvus (dense) + Elasticsearch (sparse / BM25).
+Reads data/knowledge_docs/*.txt, chunks them, embeds with Bedrock Titan v2,
+and writes to a single OpenSearch index holding both the text and the
+knn_vector for hybrid retrieval at query time.
+
+The script is idempotent: ``reset=True`` drops and recreates the index so a
+re-run doesn't duplicate chunks.
 """
 import glob
 
 import config
-from infra.rag import Chunker, Embedder, MilvusDenseRetriever, ESRetriever
+from infra.rag import BedrockEmbedder, Chunker, OpenSearchHybridRetriever
 
 
 def load_files(path_pattern: str) -> list[dict]:
@@ -23,7 +27,7 @@ def load_files(path_pattern: str) -> list[dict]:
     return docs
 
 
-def build():
+def build(reset: bool = True):
     doc_dir = config.KNOWLEDGE_DOCS_DIR
     pattern = str(doc_dir / "*.txt")
     docs = load_files(pattern)
@@ -40,22 +44,22 @@ def build():
     texts = [c["text"] for c in corpus]
     sources = [f"{c['source']}@{c['char_start']}" for c in corpus]
 
-    print("loading embedding model ...")
-    embedder = Embedder()
-
-    print("building dense index (Milvus) ...")
-    dense = MilvusDenseRetriever(dim=embedder.dim)
-    dense.reset()
+    print(f"embedding via Bedrock Titan ({config.BEDROCK_EMBEDDING_MODEL_ID}) ...")
+    embedder = BedrockEmbedder()
     embeddings = embedder.encode_docs(texts)
-    dense.insert(texts, sources, embeddings)
-    print(f"  milvus collection '{dense.collection_name}': {len(corpus)} chunks")
 
-    print("building sparse index (Elasticsearch BM25) ...")
-    sparse = ESRetriever()
-    sparse.reset()
-    sparse.bulk_insert([{"text": t, "source": s} for t, s in zip(texts, sources)])
-    print(f"  es index '{sparse.index_name}': {len(corpus)} chunks")
+    print(f"writing to OpenSearch index '{config.OPENSEARCH_INDEX}' ...")
+    retriever = OpenSearchHybridRetriever(dim=embedder.dim)
+    if reset:
+        retriever.reset()
+    else:
+        retriever.ensure_index()
 
+    retriever.bulk_insert([
+        {"text": t, "source": s, "embedding": e}
+        for t, s, e in zip(texts, sources, embeddings)
+    ])
+    print(f"  indexed {len(corpus)} chunks")
     print("done.")
 
 
