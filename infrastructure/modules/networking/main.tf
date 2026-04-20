@@ -110,7 +110,7 @@ resource "aws_security_group" "ecs_tasks" {
     to_port         = 8000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
-    description     = "ALB -> task"
+    description     = "ALB to task"
   }
 
   egress {
@@ -131,7 +131,7 @@ resource "aws_security_group" "rds" {
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.ecs_tasks.id]
-    description     = "ECS -> Postgres"
+    description     = "ECS to Postgres"
   }
 }
 
@@ -145,6 +145,6 @@ resource "aws_security_group" "opensearch" {
     to_port         = 443
     protocol        = "tcp"
     security_groups = [aws_security_group.ecs_tasks.id]
-    description     = "ECS -> OpenSearch HTTPS"
+    description     = "ECS to OpenSearch HTTPS"
   }
 }
