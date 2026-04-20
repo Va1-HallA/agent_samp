@@ -12,7 +12,7 @@ resource "aws_db_subnet_group" "main" {
 resource "aws_db_instance" "postgres" {
   identifier                 = "${var.name_prefix}-rds"
   engine                     = "postgres"
-  engine_version             = "15.5"
+  engine_version             = "15.17"
   instance_class             = var.instance_class
   allocated_storage          = var.allocated_storage_gb
   storage_encrypted          = true
